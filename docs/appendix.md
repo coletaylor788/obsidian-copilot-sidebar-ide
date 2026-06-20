@@ -24,7 +24,7 @@ need one live confirmation during implementation.
 - **Copilot watches the IDE lock dir per workspace.** ✅ from `~/.copilot/logs/process-*.log`:
   `Starting IDE lock file watcher for workspace: /Users/cole`.
 - **IDE config knobs** (`copilot help config`):
-  - `ide.autoConnect` (default `true`) — *"watch for new IDE lock files"*, auto-connect on startup. **This machine has it set to `false`** in `~/.copilot/settings.json`, which is why an offline lock-file probe did not connect.
+  - `ide.autoConnect` (default `true`) — *"watch for new IDE lock files"*, auto-connect on startup. This machine had it set to `false`. **Update:** I temporarily set it to `true` and re-ran the lock-file probe; Copilot still didn't connect to a hand-rolled (Claude-schema) server, but the PTY harness didn't boot Copilot's TUI cleanly that run, so the result is inconclusive — see §7.
   - `ide.openDiffOnEdit` (default `true`) — show edit diffs in the connected IDE; *"diagnostics and selection features still work."*
   - `updateTerminalTitle` (default `true`, `COPILOT_DISABLE_TERMINAL_TITLE` to disable) — emits OSC title with the agent's current intent.
   - `terminalProgress` (default `true`) — emits OSC `9;4` progress while working.
@@ -110,28 +110,61 @@ POST endpoint and a per-tab `setNeedsAttention()`; only the hook installation ch
   tab. (The Claude fork moved *away* from BEL sniffing to hooks for reliability; we keep it as
   a safety net.)
 
-## 7. IDE context bridge (the spike)
+## 7. IDE context bridge — two tracks
 
-The existing `ide-server.ts` is a WebSocket MCP **server** that (a) writes a lock file, (b)
-answers `initialize`/`tools/list`/`tools/call`, (c) pushes debounced `selection_changed`, and
-(d) drives a side-by-side diff modal for `openDiff`. Copilot is the **client** that discovers
-the lock and connects — the same role Claude's CLI plays. Required changes:
+**Goal:** the running Copilot must know the file open in Obsidian and the text selected, like Claude.
+This is the only feature not yet proven end-to-end with Obsidian as the server, so the design uses a
+guaranteed track plus a best-UX track.
 
-- **Lock dir:** `~/.claude/ide/` → `~/.copilot/ide/`. Keep `<port>.lock` naming unless the
-  spike shows otherwise.
-- **🔎 Auth header:** Claude uses `x-claude-code-ide-authorization`. Confirm Copilot's header
-  name and whether it reads `authToken` from the lock the same way.
-- **🔎 Lock schema:** Claude writes `{ pid, workspaceFolders, ideName, transport: "ws", authToken }`. Confirm Copilot's required fields (it may want `workspaceFolders` to contain its cwd, which it already scopes the watcher to).
-- **Discovery:** Copilot scans the dir (no `CLAUDE_CODE_SSE_PORT` analog appears necessary);
-  confirm whether any env var or flag is needed, or just `ide.autoConnect:true` / `/ide`.
+### Spike result so far (honest status)
 
-### Spike procedure (≈30 min)
+- ✅ Copilot *has* the capability: watches `~/.copilot/ide/`, `ide.autoConnect`, `/ide`,
+  `ide.openDiffOnEdit`, *"diagnostics and selection features still work."*
+- ⚠️ A local test (permissive WS server + lock mirroring Claude's `{pid, workspaceFolders, ideName,
+  transport, authToken}` schema, `ide.autoConnect` temporarily enabled, `/ide` issued) **did not
+  produce a connection**. Inconclusive: the PTY harness failed to boot Copilot's TUI cleanly that
+  run, and Copilot's handshake/lock schema may differ from Claude's. Not evidence it can't work — but
+  enough that we don't assume the Claude server is a drop-in.
 
-1. Temporarily set `ide.autoConnect:true` in `~/.copilot/settings.json` (this machine has it off).
-2. Run a tiny WS server that writes a lock to `~/.copilot/ide/<port>.lock` (`workspaceFolders=[cwd]`, random `authToken`) and **logs the HTTP upgrade request headers + first WS frames**.
-3. Launch `copilot` in that cwd (or type `/ide`), and capture: the auth header name/value, the
-   MCP `initialize` params, and the `tools/list` request. Adjust `ide-server.ts` to match.
-4. Re-test `selection_changed` push and `openDiff` round-trip end-to-end.
+### Track B — local MCP server (guaranteed; implement first)
+
+Copilot has first-class MCP support (`~/.copilot/mcp-config.json`, `copilot mcp add`, and
+`--additional-mcp-config <json>` to augment per-session). The plugin runs a small stdio/HTTP MCP
+server and registers it on each spawned tab:
+
+```
+copilot --session-id <uuid> --additional-mcp-config @/path/to/obsidian-mcp.json [...]
+```
+
+Tools to expose:
+- `get_active_note` → `{ path, content }` of the note focused in Obsidian's main editor.
+- `get_selection` → `{ text, path, range }` of the current selection (reuse the same
+  `getEditorFromRecentLeaf` logic already in `ide-tools.ts`).
+- `list_open_notes` → open tabs.
+- `open_note` → open a note in Obsidian.
+- `propose_edit` → show the existing `DiffModal` for accept/reject, then apply.
+
+Pros: no protocol reverse-engineering; works today. Cons: pull-based (model calls the tool; no
+automatic `selection_changed` push), and diff approval uses our modal rather than Copilot's native
+IDE diff. Good enough to fully satisfy "the terminal knows my open file/selection."
+
+### Track A — lock-file WS bridge (best UX; add once confirmed)
+
+Reuse `ide-server.ts` almost verbatim, pointed at `~/.copilot/ide/`. If Copilot's handshake matches,
+this yields Claude-parity: debounced `selection_changed` push + native diff-on-edit approval.
+
+Required confirmations (do this by capturing the **official** integration, not by guessing):
+1. Install/enable the official Copilot IDE integration in VS Code, open a workspace, and inspect the
+   lock file it writes to `~/.copilot/ide/` → that's the exact schema/fields to emit.
+2. Capture the WS upgrade Copilot sends (auth header name — Claude uses
+   `x-claude-code-ide-authorization`) and the MCP `initialize`/`tools/list` shape.
+3. Adjust `ide-server.ts`: lock dir, lock fields, auth header, `serverInfo`. Keep the WS framing,
+   tool catalog, selection push, and `DiffModal` wiring.
+
+### Recommendation
+
+Ship Track B in Phase 6 (reliable parity for "knows my file/selection"); pursue Track A as a
+fast-follow once the official-extension capture confirms the handshake.
 
 ---
 

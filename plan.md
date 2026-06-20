@@ -26,7 +26,7 @@ IDE bridge uses the same lock-file protocol family Claude does.
 | Per-tab conversation persistence | Scrape `~/.claude/projects/*.jsonl` to *capture* the id Claude assigns (a whole module + 12 tests) | **Mint a UUID and pass `copilot --session-id=<uuid>`; resume with `copilot --resume=<uuid>`.** No disk scraping. ✅ verified: minting + resume both work | **Much simpler** |
 | Tab naming (`/rename`) | Parse `custom-title` lines out of the conversation `.jsonl` | Read the `name:` field from `~/.copilot/session-state/<uuid>/workspace.yaml` (we own the uuid). Optional: live title from Copilot's OSC terminal-title stream | **Simpler** |
 | Bell / "needs attention" | `.claude` Stop/Notification **hooks** POST to the plugin | Copilot **also has hooks** (`stop`/`notification`, `.github/hooks` + user-level `config.json`). Same pattern; PTY-BEL sniffing as fallback | Medium |
-| Live file/selection context + diff review | WebSocket MCP server + lock file in `~/.claude/ide/`; `--ide` + `CLAUDE_CODE_SSE_PORT` | Copilot watches `~/.copilot/ide/` for lock files and auto-connects (`ide.autoConnect`, `/ide`, `ide.openDiffOnEdit`). Reuse the existing server; change lock dir + confirm auth handshake | Medium (1 spike) |
+| **Live file/selection context + diff review** | WebSocket MCP server + lock file in `~/.claude/ide/`; `--ide` + `CLAUDE_CODE_SSE_PORT` | **Two-track (see below).** Track B (local MCP server via `--additional-mcp-config`) is guaranteed; Track A (reuse the lock-file WS server at `~/.copilot/ide/`) adds Claude-style live push + native diff if the handshake matches | Medium — **the one real risk** |
 | Session-bound tab groups | Pure Obsidian workspace logic, backend-independent | Unchanged | None |
 | Shift+Enter multiline, YOLO, folder targeting | Backend flags/config | Copilot: `--allow-all-tools`/`--allow-all`, `/terminal-setup`, `-C <dir>` | Trivial |
 
@@ -50,25 +50,55 @@ IDE bridge uses the same lock-file protocol family Claude does.
 4. **Tab titles** — read `workspace.yaml` `name`; refresh on focus; persist via `getState`.
 5. **Bell / notifications** — install Copilot `stop`/`notification` hooks that ping the plugin
    with the tab id; light the per-tab bell. (PTY-BEL fallback if hook payload lacks tab id.)
-6. **IDE context bridge (the one spike)** — point the lock writer at `~/.copilot/ide/`,
-   confirm Copilot's exact lock schema + auth header by capturing a live `/ide` handshake,
-   then reuse the existing selection-push + diff-review server.
+6. **IDE context (two tracks)** — ship **Track B** first: a local MCP server registered via
+   `copilot --additional-mcp-config` exposing `get_active_note`/`get_selection`/`open_note`/
+   `propose_edit` (guaranteed live awareness of the open file + selection). Then add **Track A**:
+   reuse `ide-server.ts` at `~/.copilot/ide/` for Claude-style live push + native diff, once the
+   handshake is confirmed against the official extension's lock.
 7. **Polish** — settings copy, README/docs, CI release workflow, version reset to `0.1.0`.
-   Decide whether to keep or defer the Sprites.dev mobile path (see Open questions).
+   (Sprites.dev mobile path deferred — see Decisions.)
 
-## Risks & open questions
+## IDE context: does Copilot learn my open file & selection, "just like Claude"?
 
-- **IDE handshake details (only real unknown).** Copilot definitely watches `~/.copilot/ide/`
-  and auto-connects, but my offline probe was inconclusive because this machine has
-  `ide.autoConnect:false`. Phase 6 must capture one real connection to confirm the lock-file
-  field names, the auth header (Claude uses `x-claude-code-ide-authorization`), and the MCP
-  `initialize`/`tools` shape. Everything else in the server is reusable as-is.
-- **Hook event names/payload.** Confirm Copilot's exact `stop`/`notification` event keys and
-  whether the payload can carry a per-tab id (env-injected) for precise bell targeting.
-- **Multi-account.** This machine has multiple logged-in GitHub users; confirm spawned tabs
-  inherit the intended account.
-- **Sprites mobile mode.** The Claude fork provisions a cloud VM for mobile. Recommend
-  **deferring** it for v1 and shipping desktop-only, since Copilot's session/IDE model differs.
+**Yes — that's exactly what Copilot's IDE integration is for**, and it's the right vehicle. Confirmed
+from `copilot help config` and Copilot's own logs: it watches `~/.copilot/ide/` for lock files,
+auto-connects (`ide.autoConnect`), exposes `/ide`, routes edit diffs to the IDE for approval
+(`ide.openDiffOnEdit`), and *"diagnostics and selection features still work."* Same capability class
+as Claude's IDE bridge.
+
+**Honesty check:** this is the **only** feature I could not yet prove end-to-end with Obsidian acting
+as the server. A local spike (hand-rolled lock + WS server mirroring Claude's exact handshake) did not
+get Copilot to connect — but that test was inconclusive (the PTY harness didn't boot Copilot cleanly,
+and Copilot's handshake may differ from Claude's). So I'm treating it as **promising but unproven**,
+not "done." To guarantee the user gets the capability regardless, the plan uses two tracks:
+
+- **Track B — local MCP server (guaranteed, ship first).** The plugin runs a tiny MCP server and
+  registers it on the spawned process with `copilot --additional-mcp-config <json>`, exposing tools
+  like `get_active_note`, `get_selection`, `open_note`, `propose_edit`. Copilot's first-class MCP
+  support means it can *pull* the current Obsidian file/selection on demand and write edits back. No
+  reverse-engineering required. Trade-off vs Claude: pull-based (no automatic `selection_changed`
+  push, and diff approval happens in-terminal unless we add a modal).
+- **Track A — lock-file WS bridge (best UX, add once confirmed).** Reuse the existing `ide-server.ts`,
+  pointed at `~/.copilot/ide/`. If Copilot's handshake matches, this gives Claude-style **live
+  selection push** + **native side-by-side diff approval**. De-risk by capturing what the *official*
+  Copilot IDE integration (VS Code extension) writes to `~/.copilot/ide/` and mirroring it exactly,
+  rather than guessing.
+
+Net: the terminal will know your open file and selection like Claude — guaranteed via Track B, and
+with the nicer live-push/diff UX via Track A when the handshake is confirmed.
+
+## Decisions (open questions closed)
+
+- **Bell / notifications — solved, low risk.** Use Copilot's `stop`/`notification` hooks (it has a
+  hooks system) to ping the plugin with the tab id. If the hook payload can't carry a tab id, fall
+  back to sniffing the PTY stream for BEL (`\x07`) / OSC-9 — guaranteed since we own the stream. Bell
+  works either way.
+- **Multi-account — no special handling for v1.** Spawned tabs inherit Copilot's selected account;
+  document the `COPILOT_GITHUB_TOKEN` / `GH_HOST` env overrides for users who need a specific
+  account. (This machine has multiple logged-in users; that's fine.)
+- **Sprites.dev mobile — deferred.** Ship desktop-only for v1. Copilot's session/IDE model differs
+  enough that the cloud-VM path should be revisited separately, not block the first release.
+- **Remaining real risk: Track A handshake only**, and it's fully covered by the Track B guarantee.
 
 ## Appendix
 
