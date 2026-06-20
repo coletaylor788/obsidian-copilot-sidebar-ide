@@ -1,5 +1,13 @@
 # Plan: Unified Agent Sidebar (add GitHub Copilot CLI)
 
+> **Implementation status (in progress):** Phases 1–6 are implemented, verified, and green
+> (`bun run check`: 38 tests + build) on branch `feat/unified-backend-adapters` →
+> [PR #2](https://github.com/coletaylor788/obsidian-claude-sidebar-ide/pull/2) in the plugin repo.
+> Phase 7 (agent-neutral rebrand) is pending a name choice. Each Copilot capability was verified
+> against a real `copilot 1.0.64`: `--session-id` mint+resume, `workspace.yaml` titles, the
+> Unix-socket Streamable-HTTP MCP IDE bridge (`Connected to IDE MCP server: Obsidian`), and the
+> `agentStop`/`notification` hook bell.
+
 Evolve the existing embedded-terminal sidebar into one **multi-backend** Obsidian plugin where you
 pick your agent — Claude Code, **GitHub Copilot CLI**, Codex, Gemini, OpenCode — from a dropdown,
 with full feature parity per backend: tab naming, bell alerts, session-bound tab groups, per-tab
