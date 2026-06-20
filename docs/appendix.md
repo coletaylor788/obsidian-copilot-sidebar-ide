@@ -1,4 +1,4 @@
-# Appendix — Copilot Sidebar IDE technical detail
+# Appendix — Unified Agent Sidebar: technical detail
 
 Supporting detail for [`../plan.md`](../plan.md). Everything marked **✅ verified** was
 confirmed on this machine against `GitHub Copilot CLI 1.0.64-1`. Items marked **🔎 spike**
@@ -39,27 +39,61 @@ need one live confirmation during implementation.
 
 ---
 
-## 2. File-by-file change map (relative to the fork)
+## 2. Capability-adapter architecture & file map
 
-| File | Action |
+Introduce a `BackendAdapter` per agent, registered by id, composing four optional capability slots
+plus a spawn builder. The core (terminal, session-groups, view, settings) depends only on these
+interfaces — no `backend === "claude"` branching.
+
+```ts
+// src/backends/adapter.ts
+export interface BackendAdapter {
+  id: string;                  // "claude" | "copilot" | "codex" | ...
+  label: string;
+  binary: string;
+  buildSpawnCommand(ctx: SpawnCtx): { cliCmd: string; env: Record<string, string> };
+  persistence?: SessionPersistence;   // undefined → generic --continue only
+  title?: TitleSource;                // undefined → static label
+  notifications?: NotificationHooks;  // undefined → BEL/OSC sniff fallback only
+  ide?: IdeBridgeFactory;             // undefined → no IDE integration
+}
+
+export interface SessionPersistence {
+  prepare(ctx): { sessionId?: string };          // before spawn (Copilot: mint UUID)
+  onSpawned?(view, cwd): void;                    // after spawn (Claude: start capture poll)
+  resumeArgs(sessionId: string | null): string;  // "--resume <id>" | "--continue" | ...
+}
+export interface TitleSource { read(sessionId: string, cwd: string): string | null; }
+export interface NotificationHooks { install(cwd: string, tabId: string): { dispose(): void }; }
+export interface IdeBridge { start(): void; stop(): void; pushSelection(): void; }
+export interface IdeBridgeFactory { create(app, getVaultPath): IdeBridge; }
+```
+
+A registry `BACKENDS: Record<string, BackendAdapter>` replaces today's data-only `CLI_BACKENDS`.
+The **shared** IDE pieces (`getToolCatalog`, `handleToolCall`, selection tracking, `DiffModal`) move
+to `src/ide/` and are reused by both transports — only the transport + lock differ per backend.
+
+### File / module change map (unified — evolving the existing repo)
+
+| File / module | Action |
 |---|---|
-| `manifest.json`, `package.json` | id → `copilot-sidebar-ide`, name/description/author, version → `0.1.0` |
-| `src/backends.ts` | Add a `copilot` backend (below); make it the default |
-| `src/types.ts` | Rename `claudeSessionId`/`claudeSessionTitle` → `copilotSessionId`/`sessionTitle` (or generalize to `agentSessionId`) |
-| `src/claude-session-capture.ts` + `.test.ts` | **Delete.** Replaced by `crypto.randomUUID()` at tab creation |
-| `src/terminal-view.ts` | Mint `copilotSessionId` on first spawn; read title from `workspace.yaml`; keep `getState`/`setState`, bell, `applyTabHeaderTitle` |
-| `src/shell-manager.ts` | Build the Copilot command (below); swap Claude hook install for Copilot hook install; set lock/notify env |
-| `src/ide-server.ts` | **Swap transport** to Unix-socket + Streamable-HTTP MCP (`POST`/`GET /mcp`); write the lock to `~/.copilot/ide/` with Copilot's schema; declare the auth header in the lock's `headers`. Keep MCP message handling, selection push, tool catalog, diff modal (see §7) |
-| `src/main.ts` | Rename Claude strings in `notifyCallback`; everything else (session groups, nav commands, selection push) unchanged |
-| `src/settings.ts` | Re-label; keep backend dropdown, default cwd, auto-resume, CLI flags |
-| `new: src/copilot-session.ts` | Small pure helper: read `name`/`user_named` from `session-state/<id>/workspace.yaml` (+ unit test) |
+| `src/backends/` (new dir) | `adapter.ts` (interfaces) + `claude.ts`, `copilot.ts`, `codex.ts`, … each registering an adapter; replaces data-only `backends.ts` |
+| `src/types.ts` | Rename `claudeSessionId`/`claudeSessionTitle` → `agentSessionId`/`sessionTitle` |
+| `src/claude-session-capture.ts` (+ test) | **Keep** — becomes the Claude `SessionPersistence` impl (not deleted; just no longer Copilot's concern) |
+| `new: src/copilot-session.ts` (+ test) | Copilot `SessionPersistence` (mint UUID) + `TitleSource` (read `workspace.yaml` `name`) |
+| `src/ide/` (was `ide-server.ts`/`ide-tools.ts`/`diff-modal.ts`) | Split transport from core: shared catalog/selection/diff + `IdeTransport`s `claude-ws.ts` and `copilot-http-mcp.ts` |
+| `src/terminal-view.ts` | Replace `=== "claude"` gates with `adapter.persistence?`/`adapter.title?`; rename state to `agentSessionId` |
+| `src/shell-manager.ts` / `remote-shell-manager.ts` | Delegate command building to `adapter.buildSpawnCommand()`; hooks via `adapter.notifications?` |
+| `src/main.ts` | Generic `notifyCallback`; start `adapter.ide?` bridge instead of the Claude-only IDE server |
+| `src/settings.ts` | Backend dropdown already exists; add Copilot; agent-neutral copy |
+| `manifest.json`, `package.json` | Agent-neutral id/name/description; **keep version lineage** (bump minor, don't reset to 0.1.0) |
 
 ---
 
 ## 3. Backend definition (drop-in)
 
 ```ts
-// src/backends.ts
+// src/backends/copilot.ts (adapter base data)
 copilot: {
   label: "GitHub Copilot",
   binary: "copilot",
@@ -73,7 +107,7 @@ copilot: {
 
 ## 4. Spawn command construction
 
-- **New tab:** `copilot --session-id <uuid> [--allow-all-tools] [flags]`, where `uuid = crypto.randomUUID()` is generated in `terminal-view.ts` and stored on the view (persisted by the existing `getState()` plumbing).
+- **New tab:** `copilot --session-id <uuid> [--allow-all-tools] [flags]`, where `uuid = crypto.randomUUID()` is minted by the Copilot `SessionPersistence.prepare()` and stored on the view (persisted by the existing `getState()` plumbing).
 - **Resume on reload:** `copilot --resume <uuid> [...]`. If a tab somehow has no uuid, fall back to `--continue`.
 - **cwd / folder targeting:** spawn with `cwd` (existing logic) and/or pass `-C <dir>`; pre-trust via `--add-dir <cwd>` or rely on `settings.json` `trustedFolders` to avoid a first-run prompt (Copilot equivalent of the Claude `trustedDirectories` pre-trust step).
 - The PATH-resolution, Python-PTY, resize, and UTF-8 decoder logic in `shell-manager.ts` are backend-agnostic — keep them.
