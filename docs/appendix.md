@@ -24,7 +24,7 @@ need one live confirmation during implementation.
 - **Copilot watches the IDE lock dir per workspace.** ✅ from `~/.copilot/logs/process-*.log`:
   `Starting IDE lock file watcher for workspace: /Users/cole`.
 - **IDE config knobs** (`copilot help config`):
-  - `ide.autoConnect` (default `true`) — *"watch for new IDE lock files"*, auto-connect on startup. This machine had it set to `false`. **Update:** I temporarily set it to `true` and re-ran the lock-file probe; Copilot still didn't connect to a hand-rolled (Claude-schema) server, but the PTY harness didn't boot Copilot's TUI cleanly that run, so the result is inconclusive — see §7.
+  - `ide.autoConnect` (default `true`) — watches `~/.copilot/ide/` for lock files and auto-connects. **Proven:** with it enabled, a real Copilot detected our lock, validated its schema, matched by workspace + `ideName`, and connected (`Connected to IDE MCP server: Obsidian`). See §7 for the full captured protocol.
   - `ide.openDiffOnEdit` (default `true`) — show edit diffs in the connected IDE; *"diagnostics and selection features still work."*
   - `updateTerminalTitle` (default `true`, `COPILOT_DISABLE_TERMINAL_TITLE` to disable) — emits OSC title with the agent's current intent.
   - `terminalProgress` (default `true`) — emits OSC `9;4` progress while working.
@@ -49,7 +49,7 @@ need one live confirmation during implementation.
 | `src/claude-session-capture.ts` + `.test.ts` | **Delete.** Replaced by `crypto.randomUUID()` at tab creation |
 | `src/terminal-view.ts` | Mint `copilotSessionId` on first spawn; read title from `workspace.yaml`; keep `getState`/`setState`, bell, `applyTabHeaderTitle` |
 | `src/shell-manager.ts` | Build the Copilot command (below); swap Claude hook install for Copilot hook install; set lock/notify env |
-| `src/ide-server.ts` | Change lock dir to `~/.copilot/ide/`; adjust auth header + `serverInfo` per spike; keep WS/MCP/selection/diff logic |
+| `src/ide-server.ts` | **Swap transport** to Unix-socket + Streamable-HTTP MCP (`POST`/`GET /mcp`); write the lock to `~/.copilot/ide/` with Copilot's schema; declare the auth header in the lock's `headers`. Keep MCP message handling, selection push, tool catalog, diff modal (see §7) |
 | `src/main.ts` | Rename Claude strings in `notifyCallback`; everything else (session groups, nav commands, selection push) unchanged |
 | `src/settings.ts` | Re-label; keep backend dropdown, default cwd, auto-resume, CLI flags |
 | `new: src/copilot-session.ts` | Small pure helper: read `name`/`user_named` from `session-state/<id>/workspace.yaml` (+ unit test) |
@@ -110,61 +110,93 @@ POST endpoint and a per-tab `setNeedsAttention()`; only the hook installation ch
   tab. (The Claude fork moved *away* from BEL sniffing to hooks for reliability; we keep it as
   a safety net.)
 
-## 7. IDE context bridge — two tracks
+## 7. IDE context bridge — PROVEN protocol (port `ide-server.ts` to this transport)
 
-**Goal:** the running Copilot must know the file open in Obsidian and the text selected, like Claude.
-This is the only feature not yet proven end-to-end with Obsidian as the server, so the design uses a
-guaranteed track plus a best-UX track.
+**Goal:** the running Copilot knows the file open in Obsidian and the text selected — delivered as
+injected IDE nudges, like Claude (not model-pull tools). **Status: confirmed end-to-end** by driving
+a real `copilot 1.0.64` against a hand-built server.
 
-### Spike result so far (honest status)
+### What was observed (evidence)
 
-- ✅ Copilot *has* the capability: watches `~/.copilot/ide/`, `ide.autoConnect`, `/ide`,
-  `ide.openDiffOnEdit`, *"diagnostics and selection features still work."*
-- ⚠️ A local test (permissive WS server + lock mirroring Claude's `{pid, workspaceFolders, ideName,
-  transport, authToken}` schema, `ide.autoConnect` temporarily enabled, `/ide` issued) **did not
-  produce a connection**. Inconclusive: the PTY harness failed to boot Copilot's TUI cleanly that
-  run, and Copilot's handshake/lock schema may differ from Claude's. Not evidence it can't work — but
-  enough that we don't assume the Claude server is a drop-in.
-
-### Track B — local MCP server (guaranteed; implement first)
-
-Copilot has first-class MCP support (`~/.copilot/mcp-config.json`, `copilot mcp add`, and
-`--additional-mcp-config <json>` to augment per-session). The plugin runs a small stdio/HTTP MCP
-server and registers it on each spawned tab:
-
+From the spawned Copilot's own log against our test server:
 ```
-copilot --session-id <uuid> --additional-mcp-config @/path/to/obsidian-mcp.json [...]
+IDE lock file change detected: <id>.lock
+Found matching IDE for workspace: Obsidian (PID …)
+Connected to IDE MCP server: Obsidian
+Skipping tool getCurrentSelection for client ide
+Skipping tool getLatestSelection for client ide
+Skipping tool getOpenEditors  for client ide
+Skipping tool getWorkspaceFolders for client ide
+Skipping tool openDiff for client ide
+```
+TUI showed `● Connected to Obsidian` / `1 MCP server`. The `Skipping tool … for client ide` lines
+mean Copilot recognizes the standard VS Code IDE tool surface and consumes it as IDE features
+(injected selection/file context + diff approval) instead of registering them as model tools — the
+Claude-style behavior.
+
+### Transport (the only real difference from Claude)
+
+| | Claude | **Copilot** |
+|---|---|---|
+| Discovery | lock in `~/.claude/ide/<port>.lock` | lock in `~/.copilot/ide/<id>.lock` |
+| Transport | TCP WebSocket `ws://127.0.0.1:<port>` | **Unix domain socket** at `socketPath` |
+| Wire | WebSocket frames, MCP JSON-RPC | **Streamable-HTTP MCP**: `POST /mcp` (req/resp) + `GET /mcp` SSE (server→client push) |
+| Auth | fixed header `x-claude-code-ide-authorization` = `authToken` | **arbitrary header(s) you declare in the lock's `headers`**, echoed on every request |
+| Discovery trigger | env `CLAUDE_CODE_SSE_PORT` + dir scan | `ide.autoConnect` (default true) watches `~/.copilot/ide/`, matches by `workspaceFolders` + `ideName` |
+
+### Lock file schema (validated by Copilot)
+
+Required (Copilot rejects the lock otherwise — discovered via its Zod validation error):
+`socketPath` (string), `scheme` (string), `headers` (object), `timestamp` (number). Plus
+`workspaceFolders` (array — must contain Copilot's cwd) and `ideName` for matching. Working example:
+
+```json
+{
+  "socketPath": "/tmp/obsidian-ide-<rand>.sock",
+  "scheme": "ws",
+  "headers": { "x-obsidian-ide-auth": "<random-token>" },
+  "timestamp": 1781976000000,
+  "workspaceFolders": ["/Users/you/vault"],
+  "ideName": "Obsidian",
+  "pid": 12345,
+  "transport": "ws"
+}
 ```
 
-Tools to expose:
-- `get_active_note` → `{ path, content }` of the note focused in Obsidian's main editor.
-- `get_selection` → `{ text, path, range }` of the current selection (reuse the same
-  `getEditorFromRecentLeaf` logic already in `ide-tools.ts`).
-- `list_open_notes` → open tabs.
-- `open_note` → open a note in Obsidian.
-- `propose_edit` → show the existing `DiffModal` for accept/reject, then apply.
+`headers` is the auth mechanism: whatever you put there, Copilot sends back on every `POST /mcp`
+and on the `GET /mcp` SSE request (verified — our `x-obsidian-ide-auth` came back on every call).
 
-Pros: no protocol reverse-engineering; works today. Cons: pull-based (model calls the tool; no
-automatic `selection_changed` push), and diff approval uses our modal rather than Copilot's native
-IDE diff. Good enough to fully satisfy "the terminal knows my open file/selection."
+### Handshake observed (what the server must implement)
 
-### Track A — lock-file WS bridge (best UX; add once confirmed)
+1. `POST /mcp` → `{"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"copilot-cli","version":"1.0.64-1"}}}` → respond with `{result:{protocolVersion, serverInfo, capabilities:{tools:{}}}}` and an `Mcp-Session-Id` response header.
+2. `POST /mcp` → `notifications/initialized` (respond `202`).
+3. `GET /mcp` with `accept: text/event-stream`, `mcp-session-id`, `mcp-protocol-version` → keep open; this is the **server→client push channel** for selection/file nudges.
+4. `POST /mcp` → `tools/list` → return the IDE tool catalog (reuse `getToolCatalog()` verbatim:
+   `getCurrentSelection`, `getLatestSelection`, `getOpenEditors`, `getWorkspaceFolders`, `openDiff`,
+   `getDiagnostics`, `openFile`, `saveDocument`, …).
 
-Reuse `ide-server.ts` almost verbatim, pointed at `~/.copilot/ide/`. If Copilot's handshake matches,
-this yields Claude-parity: debounced `selection_changed` push + native diff-on-edit approval.
+### Port plan for `ide-server.ts`
 
-Required confirmations (do this by capturing the **official** integration, not by guessing):
-1. Install/enable the official Copilot IDE integration in VS Code, open a workspace, and inspect the
-   lock file it writes to `~/.copilot/ide/` → that's the exact schema/fields to emit.
-2. Capture the WS upgrade Copilot sends (auth header name — Claude uses
-   `x-claude-code-ide-authorization`) and the MCP `initialize`/`tools/list` shape.
-3. Adjust `ide-server.ts`: lock dir, lock fields, auth header, `serverInfo`. Keep the WS framing,
-   tool catalog, selection push, and `DiffModal` wiring.
+- Replace the TCP `http.createServer().listen(port)` + WS-upgrade machinery with: `http.createServer()`
+  listening on a **Unix socket path**, handling `POST /mcp` (JSON-RPC req/resp), `GET /mcp` (SSE push),
+  `DELETE /mcp` (teardown). Drop the hand-rolled WS framing (`ws-framing.ts`) — Streamable-HTTP needs no
+  WebSocket frames.
+- Keep verbatim: `getToolCatalog()` / `handleToolCall()` (`ide-tools.ts`), the selection tracking +
+  debounced push (`pushSelection`), and the `DiffModal` wiring.
+- Push selection/file changes as JSON-RPC notifications over the open `GET /mcp` SSE stream (the
+  analog of Claude's `selection_changed`). **Confirm the exact notification method name Copilot
+  ingests during Phase 6** — trivial, because our server logs every byte Copilot sends/accepts; try
+  `selection_changed` first and watch whether Copilot also calls `getCurrentSelection` internally.
+- Lock writer: emit the schema above into `~/.copilot/ide/<id>.lock`; keep the stale-lock cleanup
+  (match on `ideName === "Obsidian"` + live `pid`).
+- No `--ide` flag or `CLAUDE_CODE_SSE_PORT` needed; Copilot auto-connects when `ide.autoConnect` is
+  on (default). Optionally surface a one-time settings note if the user disabled it.
 
-### Recommendation
+### Reference: minimal working server (captured during the spike)
 
-Ship Track B in Phase 6 (reliable parity for "knows my file/selection"); pursue Track A as a
-fast-follow once the official-extension capture confirms the handshake.
+A ~70-line Node server (Unix socket + `POST`/`GET /mcp`) was enough to make Copilot print
+`Connected to Obsidian` and fetch the tool catalog. The production version is the existing
+`ide-server.ts` with the transport swapped per above.
 
 ---
 
